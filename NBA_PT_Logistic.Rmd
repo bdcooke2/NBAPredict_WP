@@ -1,0 +1,500 @@
+---
+title: "Predicting NBA Playoff Teams - Logistic Regression"
+output: html_notebook
+---
+
+# Logistic Regression 
+
+```{r}
+nba1980 <- read.csv("/Users/brian/nba1980.csv")
+```
+
+## Logistic Regression - Linearity Assumptions for Continuous Variables
+
+Before running a logistic regression model, we need to test whether each of our continuous variables has linearity with the logit. If not, it would make more sense to bin continuous variables of interest.
+
+```{r}
+library(mgcv)
+
+# Identify continuous variables in your dataset
+continuous_vars <- names(nba1980)[sapply(nba1980, function(x) is.numeric(x) && length(unique(x)) >= 10)]
+
+# Create a function to compare GAM and logistic regression for a single variable
+compare_models <- function(var) {
+  formula_gam <- as.formula(paste("playoffs ~ s(", var, ")"))
+  formula_glm <- as.formula(paste("playoffs ~", var))
+  
+  fit_gam <- gam(formula_gam, data = nba1980, family = binomial(link = 'logit'), method = 'REML')
+  
+  # Get the edf from the summary table 
+  edf <- summary(fit_gam)$s.table[, "edf"]
+  
+  logit_model <- glm(formula_glm, data = nba1980, family = binomial(link = 'logit'))
+  
+  # Perform likelihood ratio test to see if the spline adds additonal complexity to the fit
+  lrt <- anova(logit_model, fit_gam, test = 'LRT')
+  p_value <- lrt[2, "Pr(>Chi)"]
+  
+  # Return results as a named vector
+  c(variable = var, edf = edf, lrt_p_value = p_value)
+}
+
+# Loop over continuous variables and apply the function
+linearity_test <- do.call(rbind, lapply(continuous_vars, compare_models))
+
+# Convert results to a data frame for better display
+linearity_df <- as.data.frame(linearity_test, stringsAsFactors = FALSE)
+linearity_df$edf <- as.numeric(linearity_df$edf)  # Convert EDF to numeric
+linearity_df$lrt_p_value <- as.numeric(linearity_df$lrt_p_value)  # Convert p-value to numeric
+
+# Display the results table
+print(linearity_df)
+
+
+```
+Although many variables don't break the linearity assumption, we'll bin each of them to be consistent. 
+
+## Variable Binning
+
+```{r}
+# Define variables for quantile computation
+vars <- c("o_rtg", "d_rtg", "n_rtg", "pace", "f_tr", 
+          "x3p_ar", "ts_percent", "e_fg_percent", 
+          "tov_percent", "orb_percent", "ft_fga", 
+          "opp_e_fg_percent", "opp_tov_percent", 
+          "opp_drb_percent", "opp_ft_fga")
+
+# Compute quantiles for all variables
+quantiles <- lapply(vars, function(var) {
+  quantile(train[[var]], probs = c(0.2, 0.4, 0.6, 0.8))
+})
+names(quantiles) <- vars
+
+```
+
+We need to make sure the appropriate bins are listed for each category - higher is better in most cases. Lower is better for defensive rating, however.
+
+```{r}
+# Define binning functions
+bin_labels <- function(x, q) {
+  case_when(
+    x <= q[1] ~ "1 - Low",
+    x > q[1] & x <= q[2] ~ "2 - Below Average",
+    x > q[2] & x <= q[3] ~ "3 - Average",
+    x > q[3] & x <= q[4] ~ "4 - Above Average",
+    x > q[4] ~ "5 - High"
+  )
+}
+```
+
+We'll now apply each of these bins to the dataset
+
+```{r}
+# Explicit mapping of columns to binning functions
+binning_map <- list(
+  default = bin_labels      
+)
+
+# Apply binning to the dataset
+nba1980 <- nba1980 %>% 
+  mutate(playoffs = ifelse(playoffs, 1, 0),
+         age = case_when(
+           age < 24 ~ "1 - Under 24",
+           age >= 24 & age < 25 ~ "2 - 24",
+           age >= 25 & age < 26 ~ "3 - 25",
+           age >= 26 & age < 27 ~ "4 - 26",
+           age >= 27 & age < 28 ~ "5 - 27",
+           age >= 28 & age < 29 ~ "6 - 28",
+           age >= 29 & age < 30 ~ "7 - 29",
+           age >= 30 ~ "8 - 30 or older"),
+         sos = case_when(
+           sos < -0.3 ~ "1 - Weak",
+           sos >= -0.3 & sos < -0.125 ~ "2 - Below Average",
+           sos >= -0.125 & sos < 0.125 ~ "3 - Average",
+           sos >= 0.125 & sos < 0.32 ~ "4 - Above Average",
+           sos >= 0.32 ~ "5 - Difficult")
+  ) %>%
+  mutate(across(all_of(vars), 
+                ~ {
+                  # Apply the appropriate binning function based on the column name
+                  bin_func <- binning_map$default
+                  bin_func(.x, quantiles[[cur_column()]])
+                }, 
+                .names = "{.col}_bin"))
+
+```
+
+## Train / Test Split
+
+Lets do a train / test split. We'll use 70% of data for training because this dataset is relatively small. We'll then split half of the remaining 30% into validation and testing.
+
+```{r}
+set.seed(123)  
+train <- nba1980 %>% sample_frac(0.7)
+
+remaining <- setdiff(nba1980, train)
+
+valid <- remaining %>% sample_frac(0.5)  
+test <- setdiff(remaining, valid) 
+```
+
+
+```{r}
+train.logit <- train %>%
+  select(-team, -lg)
+train.logit
+```
+
+## Stepwise variable selection.
+
+Regular stepwise selection using p-value selection at appropriate cutoff level for our sample size.
+
+```{r}
+# Recreate the models with the updated column names
+full.model <- glm(playoffs ~ age + sos + o_rtg_bin + d_rtg_bin +  
+                              pace_bin + f_tr_bin + x3p_ar_bin + e_fg_percent_bin + 
+                              tov_percent_bin + orb_percent_bin + ft_fga_bin + opp_e_fg_percent_bin + 
+                              opp_tov_percent_bin + opp_drb_percent_bin + opp_ft_fga_bin,
+                  data = train.logit, family = binomial(link = "logit"))
+
+empty.model <- glm(playoffs ~ 1,
+                   data = train.logit, family = binomial(link = "logit"))
+
+# Stepwise model selection
+step.model <- step(full.model,
+                   scope = list(lower = formula(empty.model), 
+                                upper = formula(full.model)),
+                   direction = "backward", 
+                   k = qchisq(0.005, 1, lower.tail = FALSE))
+
+```
+
+## Cross-Validation 
+Stepwise variable selection only likes offensive and defensive rating to keep in the model. We'll run Cross-Validation and use stepwise selection to average performance across all folds.
+
+```{r}
+# install.packages("caret")
+library(caret)
+
+# Set up the cross-validation method
+cv_control <- trainControl(method = "cv", number = 10, # 10-fold cross-validation
+                           savePredictions = "all")  # Save all predictions for later analysis
+
+# Train the full model using cross-validation
+cv.full.model <- train(playoffs ~ age + sos + o_rtg_bin + d_rtg_bin +  
+                       pace_bin + f_tr_bin + x3p_ar_bin + e_fg_percent_bin + 
+                       tov_percent_bin + orb_percent_bin + ft_fga_bin + opp_e_fg_percent_bin + 
+                       opp_tov_percent_bin + opp_drb_percent_bin + opp_ft_fga_bin,
+                       data = train.logit, 
+                       method = "glm", family = binomial(link = "logit"),
+                       trControl = cv_control)
+
+# Print the results
+print(cv.full.model)
+
+```
+
+
+
+```{r}
+# Stepwise model selection
+step.model <- step(full.model,
+                   scope = list(lower = formula(empty.model), 
+                                upper = formula(full.model)),
+                   direction = "backward", 
+                   k = qchisq(0.005, 1, lower.tail = FALSE))
+
+# Perform cross-validation on the stepwise model
+cv.step.model <- train(formula(step.model), 
+                       data = train.logit, 
+                       method = "glm", family = binomial(link = "logit"),
+                       trControl = cv_control)
+
+print(cv.step.model)
+
+```
+
+Cross-Validation likes offensive rating, defensive rating, and we are also interested in age and SOS. 
+
+```{r}
+pl_log <- glm(playoffs ~ o_rtg_bin + d_rtg_bin + age + sos,
+              data = train.logit,
+              family = binomial(link = "logit"))
+
+summary(pl_log)
+```
+
+## Predictions on training
+
+```{r}
+train$log_p_hat <- predict(pl_log, type = "response") 
+```
+
+### ROC Curve and Cutoff
+
+AUC is 0.95, optimal cutoff of 0.519.
+
+```{r}
+# ROC curve
+library(ROCit) 
+
+logit_roc <- rocit(score = train$log_p_hat, class = train$playoffs) 
+plot(logit_roc)
+plot(logit_roc)$optimal
+summary(logit_roc) 
+```
+
+```{r}
+optimal_cutoff <- logit_roc$Cutoff[which.max(logit_roc$TPR - logit_roc$FPR)]
+cat("Optimal Cutoff:", optimal_cutoff, "\n")
+```
+
+Solid balance of prediction accuracies between teams that made the playoffs and those who didn't, so accuracy metrics should be fine to use. 88% accuracy on training data
+
+```{r}
+# Predictions and confusion matrix
+train <- train %>%
+  mutate(playoffs_hat = ifelse(log_p_hat > optimal_cutoff, 1, 0))
+
+
+confusion_matrix <- table(train$playoffs, train$playoffs_hat)
+print(confusion_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Sensitivity: ", round(sensitivity, 4), "\n")
+cat("Specificity: ", round(specificity, 4), "\n")
+
+# Gain and lift tables
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+```
+
+## Validation Predictions
+We'll get some predictions on the validation set, along with ROC and AUC / accuracy metrics. Cutoff will be the same cutoff used for the optimal one found based on our training data.
+
+```{r}
+valid$log_p_hat <- predict(pl_log, newdata = valid, type = "response")
+```
+
+```{r}
+# ROC curve
+library(ROCit) 
+
+logit_roc <- rocit(score = valid$log_p_hat, class = valid$playoffs) 
+plot(logit_roc)
+plot(logit_roc)$optimal
+summary(logit_roc) 
+```
+
+```{r}
+optimal_cutoff <- logit_roc$Cutoff[which.max(logit_roc$TPR - logit_roc$FPR)]
+cat("Optimal Cutoff:", optimal_cutoff, "\n")
+```
+
+```{r}
+# Predictions and confusion matrix
+valid <- valid %>%
+  mutate(playoffs_hat = ifelse(log_p_hat > optimal_cutoff, 1, 0))
+
+
+confusion_matrix <- table(valid$playoffs, valid$playoffs_hat)
+print(confusion_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Sensitivity: ", round(sensitivity, 4), "\n")
+cat("Specificity: ", round(specificity, 4), "\n")
+
+# Gain and lift tables
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+```
+
+Accuracy: 0.8617. Let's combine the training and validation and get our final model.
+
+```{r}
+train_valid <- bind_rows(train, valid)
+```
+
+
+```{r}
+pl_log_train_val <- glm(playoffs ~ o_rtg_bin + d_rtg_bin + age + sos,
+           data = train_valid, family = binomial(link = "logit"))
+summary(pl_log_train_val)
+```
+
+
+```{r}
+train_valid$p_hat_log <- predict(pl_log_train_val, newdata = train_valid, type = "response")
+```
+
+```{r}
+# ROC curve
+library(ROCit) 
+
+logit_roc <- rocit(score = train_valid$p_hat_log, class = train_valid$playoffs) 
+plot(logit_roc)
+plot(logit_roc)$optimal
+summary(logit_roc) 
+```
+
+```{r}
+optimal_cutoff <- logit_roc$Cutoff[which.max(logit_roc$TPR - logit_roc$FPR)]
+cat("Optimal Cutoff:", optimal_cutoff, "\n")
+```
+
+```{r}
+# Predictions and confusion matrix
+train_valid <- train_valid %>%
+  mutate(playoffs_hat = ifelse(p_hat_log > optimal_cutoff, 1, 0))
+
+
+confusion_matrix <- table(valid$playoffs, valid$playoffs_hat)
+print(confusion_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Sensitivity: ", round(sensitivity, 4), "\n")
+cat("Specificity: ", round(specificity, 4), "\n")
+
+# Gain and lift tables
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+```
+
+
+AUC on train / valid is 0.95, accuracy 0.8617, cutoff recommended as 0.599. Lets test on the test set. 
+
+```{r}
+test$p_hat_log <- predict(pl_log_train_val, newdata = test, type = "response")
+```
+
+
+
+```{r}
+# ROC curve
+library(ROCit) 
+
+logit_roc <- rocit(score = test$p_hat_log, class = test$playoffs) 
+plot(logit_roc)
+plot(logit_roc)$optimal
+summary(logit_roc) 
+```
+
+
+```{r}
+# Predictions and confusion matrix
+test <- test %>%
+  mutate(playoffs_hat = ifelse(p_hat_log > 0.4819906, 1, 0))
+
+
+confusion_matrix <- table(test$playoffs, test$playoffs_hat)
+print(confusion_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Sensitivity: ", round(sensitivity, 4), "\n")
+cat("Specificity: ", round(specificity, 4), "\n")
+
+# Gain and lift tables
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+```
+
+Final Accuracy: 87.78%
+AUC: 0.9558
+
+```{r}
+test %>%
+  select(season, team, playoffs, playoffs_hat)
+```
+
+```{r}
+# Create the test set predictions for each year
+results <- data.frame(season = integer(),
+                      team = character(),
+                      actual = integer(),
+                      predicted = integer())
+
+# Loop through each year
+for (year in seasons) {
+  
+  # Create the test set for the current year
+  test_set <- filter(nba1980, season == year)  # Test set for the current season
+  
+  # Predict on the test set using your trained model
+  predictions <- predict(pl_log_train_val, newdata = test_set, type = "response")
+  
+  # Convert predictions to binary outcomes and to integer type
+  predicted_class <- as.integer(ifelse(predictions > optimal_cutoff, 1, 0))
+  
+  # Append results (ensure actual is also integer)
+  temp_results <- data.frame(
+    season = year,
+    team = test_set$team,
+    actual = as.integer(test_set$playoffs),
+    predicted = predicted_class
+  )
+  
+  # Combine results
+  results <- bind_rows(results, temp_results)
+}
+```
+
+```{r}
+# Overall Accuracy Calculation
+overall_accuracy <- sum(results$actual == results$predicted) / nrow(results)
+
+cat("Overall Accuracy:", overall_accuracy, "\n")
+
+```
+
+```{r}
+results
+```
+
+
+```{r}
+calculate_accuracy <- function(data, start_year = 1980, end_year = 2024) {
+  accuracy_results <- data.frame(season = integer(), accuracy = numeric())
+  
+  for (year in start_year:end_year) {
+    # Filter the data for the current season
+    season_data <- filter(data, season == year)
+    
+    # Calculate accuracy for the current season
+    accuracy <- sum(season_data$actual == season_data$predicted) / nrow(season_data)
+    
+    # Append to the results
+    accuracy_results <- rbind(accuracy_results, data.frame(season = year, accuracy = accuracy))
+  }
+  
+  return(accuracy_results)
+}
+
+# Call the function and store the results
+season_accuracy <- calculate_accuracy(results, 1980, 2024)
+
+# Display the results
+print(season_accuracy)
+
+```
+
+
+
+
+
+
