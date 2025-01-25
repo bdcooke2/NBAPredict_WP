@@ -15,8 +15,7 @@ nba <- nba %>%
 nba
 ```
 
-
-#### Through some through checks with the target variable (playoffs), it was determined that the proper playoffs teams weren't implemented in 2023 and 2024, so changes are made in the code below.
+Through some through checks with the target variable (playoffs), it was determined that the proper playoffs teams weren't implemented in 2023 and 2024, so changes are made in the code below.
 
 ```{r}
 # Teams that made the playoffs for the 2023 season
@@ -43,7 +42,7 @@ nba$playoffs[nba$team %in% playoff_teams_2024 & nba$season == 2024] <- TRUE
 nba
 ```
 
-#### Due to data tracking issues, we'll just use data from 1980, onward for this study. This also allows for us to be consistent with the NBA three point line's introduction, which was in 1980.
+Due to data tracking issues, we'll just use data from 1980, onward for this study. This also allows for us to be consistent with the NBA three point line's introduction, which was in 1980.
 
 ```{r}
 # Filter data to 1980 season onward
