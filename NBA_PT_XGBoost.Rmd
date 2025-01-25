@@ -1,0 +1,506 @@
+---
+title: "Predicting NBA Playoff Teams - XGBoost"
+output: html_notebook
+---
+
+
+```{r}
+nba1980 <- read.csv("/Users/brian/nba1980.csv")
+```
+
+
+Although many variables don't break the linearity assumption, we'll bin each of them to be consistent. 
+
+## Variable Binning
+
+```{r}
+# Define variables for quantile computation
+vars <- c("o_rtg", "d_rtg", "n_rtg", "pace", "f_tr", 
+          "x3p_ar", "ts_percent", "e_fg_percent", 
+          "tov_percent", "orb_percent", "ft_fga", 
+          "opp_e_fg_percent", "opp_tov_percent", 
+          "opp_drb_percent", "opp_ft_fga")
+
+# Compute quantiles for all variables
+quantiles <- lapply(vars, function(var) {
+  quantile(train[[var]], probs = c(0.2, 0.4, 0.6, 0.8))
+})
+names(quantiles) <- vars
+
+```
+
+We need to make sure the appropriate bins are listed for each category - higher is better in most cases. Lower is better for defensive rating, however.
+
+```{r}
+# Define binning functions
+bin_labels <- function(x, q) {
+  case_when(
+    x <= q[1] ~ "1 - Low",
+    x > q[1] & x <= q[2] ~ "2 - Below Average",
+    x > q[2] & x <= q[3] ~ "3 - Average",
+    x > q[3] & x <= q[4] ~ "4 - Above Average",
+    x > q[4] ~ "5 - High"
+  )
+}
+```
+
+We'll now apply each of these bins to the dataset
+
+```{r}
+# Explicit mapping of columns to binning functions
+binning_map <- list(
+  default = bin_labels      
+)
+
+# Apply binning to the dataset
+nba1980 <- nba1980 %>% 
+  mutate(playoffs = ifelse(playoffs, 1, 0),
+         age = case_when(
+           age < 24 ~ "1 - Under 24",
+           age >= 24 & age < 25 ~ "2 - 24",
+           age >= 25 & age < 26 ~ "3 - 25",
+           age >= 26 & age < 27 ~ "4 - 26",
+           age >= 27 & age < 28 ~ "5 - 27",
+           age >= 28 & age < 29 ~ "6 - 28",
+           age >= 29 & age < 30 ~ "7 - 29",
+           age >= 30 ~ "8 - 30 or older"),
+         sos = case_when(
+           sos < -0.3 ~ "1 - Weak",
+           sos >= -0.3 & sos < -0.125 ~ "2 - Below Average",
+           sos >= -0.125 & sos < 0.125 ~ "3 - Average",
+           sos >= 0.125 & sos < 0.32 ~ "4 - Above Average",
+           sos >= 0.32 ~ "5 - Difficult")
+  ) %>%
+  mutate(across(all_of(vars), 
+                ~ {
+                  # Apply the appropriate binning function based on the column name
+                  bin_func <- binning_map$default
+                  bin_func(.x, quantiles[[cur_column()]])
+                }, 
+                .names = "{.col}_bin"))
+
+```
+
+Select the variables we want present for XGBoost
+
+```{r}
+boost_vars <- train %>%
+  select(-lg, -abbreviation, -w, -l, -pw, -pl, -mov, -n_rtg, -o_rtg, -d_rtg, -n_rtg, -n_rtg_bin, -pace, -f_tr, -x3p_ar, -ts_percent, -e_fg_percent, -tov_percent, -orb_percent, -ft_fga, -opp_e_fg_percent, -opp_tov_percent, -opp_drb_percent, -opp_ft_fga, -srs)
+boost_vars
+
+boost_vars_val <- valid %>%
+  select(-lg, -abbreviation, -w, -l, -pw, -pl, -mov, -n_rtg, -o_rtg, -d_rtg, -n_rtg, -n_rtg_bin, -pace, -f_tr, -x3p_ar, -ts_percent, -e_fg_percent, -tov_percent, -orb_percent, -ft_fga, -opp_e_fg_percent, -opp_tov_percent, -opp_drb_percent, -opp_ft_fga, -srs)
+boost_vars_val
+
+boost_vars_test <- test %>%
+  select(-lg, -abbreviation, -w, -l, -pw, -pl, -mov, -n_rtg, -o_rtg, -d_rtg, -n_rtg, -n_rtg_bin, -pace, -f_tr, -x3p_ar, -ts_percent, -e_fg_percent, -tov_percent, -orb_percent, -ft_fga, -opp_e_fg_percent, -opp_tov_percent, -opp_drb_percent, -opp_ft_fga, -srs)
+boost_vars_test
+```
+
+
+## XGBoost - Training
+
+```{r}
+train_x <- model.matrix(playoffs ~ ., data = boost_vars)[, -1]
+train_y <- boost_vars$playoffs
+train_y <- as.integer(train_y)
+```
+
+
+```{r}
+# Find columns in train_x that are not in valid_x
+setdiff(colnames(train_x), colnames(valid_x))
+
+setdiff(colnames(valid_x), colnames(train_x))
+```
+
+
+
+```{r}
+# Define the team names to be removed
+teams_to_remove <- c("teamKansas City Kings", "teamNew Orleans Hornets", 
+                     "teamNew Orleans/Oklahoma City Hornets", "teamVancouver Grizzlies", "log_p_hat", "playoffs_hat")
+
+# Remove columns from train_x that match the team names
+train_x <- train_x[, !colnames(train_x) %in% teams_to_remove]
+
+
+teams_to_remove <- c("playoffs_hat")
+
+# Remove columns from valid_x that match the team names
+valid_x <- valid_x[, !colnames(valid_x) %in% teams_to_remove]
+```
+
+
+
+```{r}
+library(xgboost)
+
+set.seed(1)
+
+# RMSE train and test - 23 is optimal
+xgbcv.playoffs <- xgb.cv(data = train_x, label = train_y, subsample = 0.5, nrounds = 50, nfold = 10, objective = "binary:logistic", eval_metric = "auc")
+```
+
+
+```{r}
+# Setting the tune grid for initial tuning parameters
+
+set.seed(1)
+
+tune_grid <- expand.grid(
+  nrounds = 28,
+  eta = c(0.1, 0.2, 0.3, 0.4, 0.5),
+  max_depth = c(1:10),
+  gamma = c(0),
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = c(0.2, 0.4, 0.6, 0.8, 1)
+)
+
+# Apply tuning and plot
+
+xgb.playoffs.caret <- train(x = train_x, y = train_y,
+                       method = "xgbTree",
+                       tuneGrid = tune_grid,
+                       trControl = trainControl(method = 'cv', number = 10)
+                       )
+```
+
+
+
+```{r}
+plot(xgb.playoffs.caret)
+```
+
+```{r}
+xgb.playoffs.caret
+```
+
+```{r}
+# Evaluate the best tune
+
+xgb.playoffs.caret$results[which.min(xgb.playoffs.caret$results$RMSE), ]
+```
+
+```{r}
+set.seed(1)
+
+xgb_model_final <- xgboost(data = train_x, label = train_y,
+                           eval_metric = "auc", objective = "binary:logistic",
+                           subsample = 1, nrounds = 28,
+                           max_depth = 5, eta = 0.2, gamma = 0, 
+                           colsample_bytree = 1, min_child_weight = 1)
+```
+
+```{r}
+xgb.ggplot.importance(xgb.importance(feature_names = colnames(train_x), model = xgb_model_final))
+xgb.importance(feature_names = colnames(train_x), model = xgb_model_final)
+```
+
+
+```{r}
+# Add p_hat directly to the train data frame
+train <- train %>%
+  mutate(p_hat = predict(xgb_model_final, newdata = train_x, type = "response"))
+```
+
+```{r}
+# Use rocit to calculate ROC
+logit_roc <- rocit(score = train$p_hat, class = train_y)
+
+# Plot ROC and calculate the optimal cutoff
+plot(logit_roc)
+optimal_cutoff <- logit_roc$Cutoff[which.max(logit_roc$TPR - logit_roc$FPR)]
+cat("Optimal Cutoff:", optimal_cutoff, "\n")
+```
+
+
+
+```{r}
+# Summary of the ROC
+summary(logit_roc)
+
+# KS Statistic and Cutoff
+ksplot(logit_roc)
+cat("KS Stat: ", ksplot(logit_roc)$`KS Stat`, "\n")
+cat("KS Cutoff: ", ksplot(logit_roc)$`KS Cutoff`, "\n")
+```
+
+
+
+```{r}
+# Predictions and confusion matrix
+train <- train %>%
+  mutate(playoffs_hat = ifelse(p_hat > optimal_cutoff, 1, 0))
+
+confusion_matrix <- table(train$playoffs, train$playoffs_hat)
+print(confusion_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Sensitivity: ", round(sensitivity, 4), "\n")
+cat("Specificity: ", round(specificity, 4), "\n")
+
+# Gain and lift tables
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+```
+
+```{r}
+valid_x <- model.matrix(playoffs ~ ., data = boost_vars_val)[, -1]
+valid_y <- boost_vars_val$playoffs
+valid_y <- as.integer(valid_y)
+```
+
+
+```{r}
+# Find columns in train_x that are not in valid_x
+setdiff(colnames(train_x), colnames(valid_x))
+
+setdiff(colnames(valid_x), colnames(train_x))
+```
+
+```{r}
+# Define the team names to be removed
+teams_to_remove <- c("p_hat_log", "playoffs_hat", "log_p_hat")
+
+# Remove columns from valid_x that match the team names
+valid_x <- valid_x[, !colnames(valid_x) %in% teams_to_remove]
+
+# Define the team names to be removed
+teams_to_remove <- c("log_p_hat")
+
+# Remove columns from train_x that match the team names
+train_x <- train_x[, !colnames(train_x) %in% teams_to_remove]
+
+```
+
+```{r}
+# Find columns in train_x that are not in valid_x
+setdiff(colnames(train_x), colnames(valid_x))
+
+setdiff(colnames(valid_x), colnames(train_x))
+```
+
+
+
+
+
+```{r}
+# Generate predictions for the validation set (matching the number of rows in valid)
+valid_p_hat <- predict(xgb_model_final, newdata = as.matrix(valid_x), type = "response")
+
+# Add predictions to the valid data frame
+valid <- valid %>%
+  mutate(valid_p_hat = valid_p_hat[1:nrow(valid)])
+```
+
+
+
+
+```{r}
+# Use rocit to calculate ROC
+logit_roc <- rocit(score = valid$valid_p_hat, class = valid_y)
+
+# Plot ROC and calculate the optimal cutoff
+plot(logit_roc)
+optimal_cutoff <- logit_roc$Cutoff[which.max(logit_roc$TPR - logit_roc$FPR)]
+cat("Optimal Cutoff:", optimal_cutoff, "\n")
+```
+
+
+```{r}
+# Summary of the ROC
+summary(logit_roc)
+
+# KS Statistic and Cutoff
+ksplot(logit_roc)
+cat("KS Stat: ", ksplot(logit_roc)$`KS Stat`, "\n")
+cat("KS Cutoff: ", ksplot(logit_roc)$`KS Cutoff`, "\n")
+```
+
+```{r}
+# Predictions and confusion matrix
+valid <- valid %>%
+  mutate(playoffs_hat = ifelse(valid_p_hat > optimal_cutoff, 1, 0))
+
+confusion_matrix <- table(valid$playoffs, valid$playoffs_hat)
+print(confusion_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Sensitivity: ", round(sensitivity, 4), "\n")
+cat("Specificity: ", round(specificity, 4), "\n")
+
+# Gain and lift tables
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+```
+
+```{r}
+colnames(valid) <- colnames(train)
+```
+
+```{r}
+train <- train[, -ncol(train)]
+valid <- valid[, -ncol(valid)]
+```
+
+```{r}
+train
+valid
+```
+
+
+```{r}
+train_valid <- rbind(train, valid)
+```
+
+
+```{r}
+boost_vars_train_val <- train_valid %>%
+  select(-lg, -abbreviation, -w, -l, -pw, -pl, -mov, -n_rtg, -o_rtg, -d_rtg, -n_rtg, -n_rtg_bin, -pace, -f_tr, -x3p_ar, -ts_percent, -e_fg_percent, -tov_percent, -orb_percent, -ft_fga, -opp_e_fg_percent, -opp_tov_percent, -opp_drb_percent, -opp_ft_fga, -srs, -log_p_hat, -playoffs_hat)
+boost_vars
+```
+
+```{r}
+train_valid_x <- model.matrix(playoffs ~ ., data = boost_vars_train_val)[, -1]
+train_valid_y <- boost_vars_train_val$playoffs
+train_valid_y <- as.integer(train_valid_y)
+```
+
+
+
+
+```{r}
+test_x <- model.matrix(playoffs ~ ., data = boost_vars_test)[, -1]
+test_y <- boost_vars_test$playoffs
+test_y <- as.integer(test_y)
+```
+
+
+```{r}
+# Find columns in train_x that are not in valid_x
+setdiff(colnames(train_valid_x), colnames(test_x))
+
+# Find columns in valid_x that are not in train_x
+setdiff(colnames(test_x), colnames(train_valid_x))
+```
+
+
+```{r}
+# Define the team names to be removed
+teams_to_remove <- c("teamKansas City Kings", "teamNew Orleans Hornets", 
+                     "teamNew Orleans/Oklahoma City Hornets", "teamVancouver Grizzlies",
+                     "playoffs_hat", "teamNew Orleans Pelicans")
+
+# Remove columns from train_x that match the team names
+train_valid_x <- train_valid_x[, !colnames(train_valid_x) %in% teams_to_remove]
+
+# Define the team names to be removed
+teams_to_remove <- c("p_hat_log", "playoffs_hat")
+
+# Remove columns from test_x that match the team names
+test_x <- test_x[, !colnames(test_x) %in% teams_to_remove]
+
+```
+
+```{r}
+# Define the team names to be removed
+teams_to_remove <- c("teamNew Orleans Hornets")
+
+# Remove columns from test_x that match the team names
+test_x <- test_x[, !colnames(test_x) %in% teams_to_remove]
+```
+
+
+```{r}
+# Find columns in train_x that are not in valid_x
+setdiff(colnames(train_valid_x), colnames(test_x))
+
+# Find columns in valid_x that are not in train_x
+setdiff(colnames(test_x), colnames(train_valid_x))
+```
+
+
+```{r}
+set.seed(1)
+
+xgb_model_final_test <- xgboost(data = train_valid_x, label = train_valid_y,
+                           eval_metric = "auc", objective = "binary:logistic",
+                           subsample = 1, nrounds = 28,
+                           max_depth = 5, eta = 0.2, gamma = 0, 
+                           colsample_bytree = 1, min_child_weight = 1)
+
+```
+
+```{r}
+xgb.ggplot.importance(xgb.importance(feature_names = colnames(train_valid_x), model = xgb_model_final_test))
+xgb.importance(feature_names = colnames(train_valid_x), model = xgb_model_final_test)
+```
+
+
+
+
+
+```{r}
+# Generate predictions for the test set (matching the number of rows in test)
+test_p_hat <- predict(xgb_model_final_test, newdata = as.matrix(test_x), type = "response")
+
+# Add predictions to the test data frame
+test <- test %>%
+  mutate(test_p_hat = test_p_hat[1:nrow(test)])
+
+```
+
+
+```{r}
+# Use rocit to calculate ROC
+logit_roc <- rocit(score = test$test_p_hat, class = test_y)
+
+# Plot ROC and calculate the optimal cutoff
+plot(logit_roc)
+optimal_cutoff <- logit_roc$Cutoff[which.max(logit_roc$TPR - logit_roc$FPR)]
+cat("Optimal Cutoff:", optimal_cutoff, "\n")
+```
+
+```{r}
+# Summary of the ROC
+summary(logit_roc)
+
+# KS Statistic and Cutoff
+ksplot(logit_roc)
+cat("KS Stat: ", ksplot(logit_roc)$`KS Stat`, "\n")
+cat("KS Cutoff: ", ksplot(logit_roc)$`KS Cutoff`, "\n")
+```
+
+```{r}
+# Predictions and confusion matrix
+test <- test %>%
+  mutate(playoffs_hat = ifelse(test_p_hat > 0.696377, 1, 0))
+
+confusion_matrix <- table(test$playoffs, test$playoffs_hat)
+print(confusion_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(confusion_matrix)) / sum(confusion_matrix)
+sensitivity <- confusion_matrix[2, 2] / sum(confusion_matrix[2, ])
+specificity <- confusion_matrix[1, 1] / sum(confusion_matrix[1, ])
+cat("Accuracy: ", round(accuracy, 4), "\n")
+cat("Sensitivity: ", round(sensitivity, 4), "\n")
+cat("Specificity: ", round(specificity, 4), "\n")
+
+# Gain and lift tables
+logit_lift <- gainstable(logit_roc)
+print(logit_lift)
+```
+
+
+
